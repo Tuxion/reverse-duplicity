@@ -1,0 +1,209 @@
+#!/bin/bash
+
+VERSION="reverse-duplicity Version 0.0.1 Alpha"
+CONFIG_DIR="/etc/reverse-duplicity"
+PROFILES_DIR="$CONFIG_DIR/profiles"
+MOUNT_DIR="/media"
+TMPDIR='/tmp'
+
+# Shows usage/
+function usage {
+  echo $VERSION
+  cat << EOF
+    Usage: reverse-duplicity <command> <profile_name> [options]
+
+    Commands:
+      create        Creates a new profile using an interactive dialog.
+      backup        Executes a backup.
+      validate      Validates the backups.
+      purge         Purges old backups.
+    
+    Options:
+      -h --help     Displays this usage information.
+      -v --version  Displays version information.
+      -f --forced   Forces the supplied command.
+    
+EOF
+  echo $usage_str
+}
+
+# Loads the contents of a profile file.
+function load_profile {
+  
+  # Check if the parameter is a full profile path.
+  if [ -f $1/config ]; then
+    PROFILE_DIR=$1
+    . $1/config
+
+  # Otherwise, see if it's an alias for the home folder profiles.
+  elif [ -f $PROFILES_DIR/$1/config ]; then
+    PROFILE_DIR=$PROFILES_DIR/$1
+    . $PROFILES_DIR/$1/config
+  
+  # Neither means we can't load the profile.
+  else
+    echo "Unknown profile: $1"
+    exit 1
+  fi
+  
+}
+
+# Creates a new profile, interactively.
+function create_profile {
+  
+  TGT_FOLDER=`echo $PROFILES_DIR/$1`
+  TGT_FILE="$TGT_FOLDER/config"
+  
+  # Check the file.
+  if [ -f $TGT_FILE ]; then
+    
+    # In forced mode we can overwrite.
+    # Otherwise, this is an error.
+    if [ ! $FORCED ]; then
+      echo "A profile with this name already exists."
+      exit
+    fi
+    
+  fi
+  
+  read -p "Enter FTP host: " SRC_FTP_HOST
+  read -p "Enter FTP user (empty for anonymous): " SRC_FTP_USER
+  
+  # Kind of pointless to ask if the user is not set.
+  if [[ $SRC_FTP_USER != "" ]]; then
+    read -p "Enter FTP password: " SRC_FTP_PASS
+  else
+    SRC_FTP_PASS=""
+  fi
+  
+  read -p "Enter backup file location: " TARGET
+  
+  read -p "Enter max age of incremental backups (example: 2M): " MAX_AGE
+  read -p "Enter max age of a full backup (example: 1M): " MAX_FULLBKP_AGE
+  read -p "Enter max full backup (example: 3): " MAX_FULL_BACKUPS
+  
+  read -p "Enter volume size in MB (example: 512): " VOLSIZE
+  
+  
+  # If we are here and the file exists, it means we are forcing an overwrite.
+  if [ -f $TGT_FILE ]; then
+    `rm -f $TGT_FILE`
+  
+  # Otherwise, we have to make sure the folder exists.
+  elif [ ! -d $TGT_FOLDER ]; then
+    `mkdir -p $TGT_FOLDER`
+  fi
+  
+  NOW=`date +%Y-%m-%d\ %H:%M:%S`
+  
+  echo "# Generated: $NOW" >> $TGT_FILE
+  echo "SRC_FTP_HOST=$SRC_FTP_HOST" >> $TGT_FILE
+  echo "SRC_FTP_USER=$SRC_FTP_USER" >> $TGT_FILE
+  echo "SRC_FTP_PASS=$SRC_FTP_PASS" >> $TGT_FILE
+  
+  echo "TARGET=$TARGET" >> $TGT_FILE
+  echo "MAX_AGE=$MAX_AGE" >> $TGT_FILE
+  echo "MAX_FULLBKP_AGE=$MAX_FULLBKP_AGE" >> $TGT_FILE
+  echo "MAX_FULL_BACKUPS=$MAX_FULL_BACKUPS" >> $TGT_FILE
+  echo "VOLSIZE=$VOLSIZE" >> $TGT_FILE
+  
+  echo "Created file $TGT_FILE"
+  echo "Editing file $TGT_FOLDER/exclude"
+  echo "# This is the exclude file for the $1 profile." >> $TGT_FOLDER/exclude
+  vi $TGT_FOLDER/exclude
+  
+}
+
+function connect_src_ftp {
+  echo "Connecting to source $SRC_FTP_HOST..."
+  MOUNT_PATH="$MOUNT_DIR/.src-ftp-$RANDOM"
+  mkdir -p $MOUNT_PATH
+  chmod 700 $MOUNT_PATH
+  curlftpfs -o"user=$SRC_FTP_USER:$SRC_FTP_PASS" $SRC_FTP_HOST $MOUNT_PATH
+  cd $MOUNT_PATH
+}
+
+function backup {
+  echo "Starting backup of $PROFILE in output directory $TARGET"
+  SAFE_PATH=$(echo $MOUNT_PATH | sed -e 's/\\/\\\\/g' -e 's/\//\\\//g' -e 's/&/\\\&/g')
+  TMP_FILE_LIST=$PROFILE_DIR/.exclude-$RANDOM
+  cat $PROFILE_DIR/exclude | sed -e "s/^\([+-]\?[ ]\?\)\./\1$SAFE_PATH/" >> $TMP_FILE_LIST
+  duplicity --name "reverse-duplicity_$SAFE_PATH" --no-encryption --verbosity '3' --volsize $VOLSIZE --exclude-globbing-filelist $TMP_FILE_LIST  $MOUNT_PATH file://$TARGET
+  rm -f $TMP_FILE_LIST
+}
+
+function disconnect_src_ftp {
+  echo "Disconnecting from source..."
+  cd ..
+  fusermount -u $MOUNT_PATH
+  rmdir $MOUNT_PATH
+}
+
+# Grab the first arguments`.
+CMD=$1
+PROFILE=$2
+shift 2
+
+# Check command.
+if [[ $CMD = "" ]]; then
+  echo "No command set."
+  usage
+  exit 1
+fi
+
+# Check profile.
+if [[ $PROFILE = "" ]]; then
+  echo "No profile set."
+  usage
+  exit 1
+fi
+
+# Check for the profile directory.
+# This is just to be nice to users wanting to make a profile.
+if [ ! -d  $PROFILES_DIR ]; then
+  mkdir -p $PROFILES_DIR
+  chmod 700 $PROFILES_DIR
+fi
+
+# Read the options.
+while true; do
+  case $1 in
+    -h|--help)
+      usage; exit 0;;
+    -v|--version)
+      echo $VERSION; exit 0;;
+    -f|--forced)
+      FORCED=true; shift;;
+    *) shift; break;;
+  esac
+done
+
+# See what we're going to do.
+case "$CMD" in
+  
+  "create")
+    create_profile $PROFILE
+    ;;
+    
+  "backup")
+    load_profile $PROFILE
+    connect_src_ftp
+    backup
+    disconnect_src_ftp
+    echo "Done"
+    ;;
+    
+  "validate")
+    load_profile $PROFILE
+    ;;
+    
+  "purge")
+    load_profile $PROFILE
+    ;;
+    
+  *)
+    echo "Unknown command."
+    usage
+    ;;
+  
+esac
